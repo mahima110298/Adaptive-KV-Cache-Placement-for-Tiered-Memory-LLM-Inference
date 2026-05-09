@@ -1,31 +1,16 @@
-# Track B — Hierarchical & Tiered Memory for LLM Inference
+# Adaptive KV-Cache Placement for Tiered-Memory LLM Inference
 
-**Authors:** Sarah Pradhan, Sahil Vanjara, Mahima Sachan
+**Authors:** Mahima Sachan, Sarah Pradhan, Sahil Vanjara
 **Course:** Advanced Computer Architecture · Project 9 · Track B
 **Institution:** California State University, Long Beach — Department of Computer Science and Engineering
 
 Modified inference pipeline with explicit memory placement, plus an **adaptive KV-placement policy** evaluated against the static-placement baseline used by current open-source inference engines.
 
-This repository contains the entire reproducible artifact for the project paper. A single Colab notebook (`track_b.ipynb`) builds the simulator, runs the experimental matrix on a real GPU, and produces every figure / table cited in the paper.
+This repository contains the entire reproducible artifact for the project paper. A single Colab notebook (`Adaptive KV-Cache Placement for Tiered-Memory LLM Inference.ipynb`) builds the simulator, runs the experimental matrix on a real GPU, and produces every figure / table cited in the paper.
 
 ---
 
-## What's here
-
-```
-track_b_tiered_memory/
-├── track_b.ipynb            # Self-contained Colab notebook (the runnable artifact)
-├── tiered_memory_sim.py     # Standalone copy of the 4-tier simulator + adaptive analyzer
-├── README.md                # This file
-└── paper/
-    ├── main.tex             # IEEEtran double-column paper
-    ├── references.bib       # IEEE-style bibliography (kept for compile safety; manual refs in main.tex)
-    └── figures/             # PNGs produced by the notebook
-```
-
 The simulator class is defined inline inside the notebook (so the notebook is self-sufficient). `tiered_memory_sim.py` is the same class plus the `analyze_static_vs_adaptive` post-hoc analysis as a standalone module, useful if you want to import it from your own scripts.
-
-The submission GitHub repository (per the rubric's code-submission requirement) is hosted at: https://github.com/mahima110298/llama.cpp — this folder (`track_b_tiered_memory/`) sits at the repo root.
 
 ---
 
@@ -35,7 +20,7 @@ The submission GitHub repository (per the rubric's code-submission requirement) 
 
 For the cross-bandwidth validation reported in the paper, **run the notebook twice** — once on each GPU class — so the two output zips don't overwrite each other:
 
-1. Open `track_b.ipynb` in Colab: **File → Upload notebook**.
+1. Open `Adaptive KV-Cache Placement for Tiered-Memory LLM Inference.ipynb` in Colab: **File → Upload notebook**.
 2. **First run — A100 GPU:**
    - Runtime → Change runtime type → A100 GPU
    - Runtime → Run all (~10–15 min; first run downloads ~4.4 GB of models)
