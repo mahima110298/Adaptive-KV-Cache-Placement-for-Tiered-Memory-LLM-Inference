@@ -1,0 +1,19 @@
+model,opt,bytes_per_tok,ratio_vs_baseline,extra_note
+smollm2-135m,baseline (fp16 KV),199849312,1.0,
+smollm2-135m,KV-quant int8,152651872,0.7638348637397361,
+smollm2-135m,KV-quant int4,129053152,0.6457522956096041,
+smollm2-135m,sliding window=512,117273952,0.5868118875485546,
+smollm2-135m,sliding window=1024,129070432,0.645838760755904,
+smollm2-135m,fused-attn prefill saving,199849312,1.0,eliminates 0.6 GB QK^T traffic
+tinyllama-1.1b,baseline (fp16 KV),761085312,1.0,
+tinyllama-1.1b,KV-quant int8,714936704,0.9393647370769389,
+tinyllama-1.1b,KV-quant int4,691862400,0.9090471056154084,
+tinyllama-1.1b,sliding window=512,680344960,0.8939141897406634,
+tinyllama-1.1b,sliding window=1024,691879296,0.9090693054919972,
+tinyllama-1.1b,fused-attn prefill saving,761085312,1.0,eliminates 2.1 GB QK^T traffic
+llama-2-7b,baseline (fp16 KV),6229012160,1.0,
+llama-2-7b,KV-quant int8,5155008192,0.8275803706249307,
+llama-2-7b,KV-quant int4,4618006208,0.741370555937396,
+llama-2-7b,sliding window=512,4349963968,0.6983392962263859,
+llama-2-7b,sliding window=1024,4618399424,0.7414336824797594,
+llama-2-7b,fused-attn prefill saving,6229012160,1.0,eliminates 2.1 GB QK^T traffic
