@@ -49,7 +49,7 @@ For interactive workloads -- chat, coding assistants, agentic loops -- this sing
 \item \textbf{A four-tier hierarchical memory simulator} (SRAM, HBM, DRAM, FAR\_MEM) integrated as a modified inference pipeline atop \texttt{llama-cpp-python}, providing capacity-aware placement, migration tracking, bandwidth-bound latency, and per-byte energy modeling. The pipeline drives both the static policy (baseline) and our adaptive policy. (Section~\ref{sec:design}, Section~\ref{sec:impl}.)
 \item \textbf{Cross-bandwidth empirical validation} across two NVIDIA accelerators spanning a $4.86\times$ HBM-bandwidth ratio (A100-SXM4-40GB, T4). Measured throughput ratio matches the bandwidth ratio within 11\% on Llama-2-7B, supporting the central memory-bound thesis on real hardware. (Sec.~\ref{sec:results-cross}.)
 \item \textbf{A unified bytes-per-token comparison} of KV quantization, sliding-window attention, and FlashAttention-style fusion -- across all three models. Sliding-window $W=512$ delivers the largest reduction (30\%) for Llama-2-7B at our test context. (Sec.~\ref{sec:results-opt}.)
-\item \textbf{A reproducible, single-notebook artifact.} The complete code (simulator, pipeline, experiments, figures) executes end-to-end on a Colab Pro A100 in $\sim$15~min and is published as a public GitHub repository.
+\item \textbf{A reproducible, single-notebook artifact.} The complete code (simulator, pipeline, experiments, figures) executes end-to-end on a Colab Pro A100 and is published as a public GitHub repository.
 \end{itemize}
 
 % ─────────────────────────────────────────────────────────────────────────
@@ -146,11 +146,10 @@ with $B(\cdot)$ from Table~\ref{tab:tiers}. Per-byte energy is charged at the pl
 We model three traffic-reduction techniques:
 
 \begin{description}
-\item[O1: KV quantization.] Reduce $e_{\text{KV}}$ from 2.0 (fp16) to 1.0 (int8) or 0.5 (int4). Reduces $b_{\text{KV}}$ proportionally and defers tier migration by the same factor.
-\item[O2: Sliding-window attention.] Replace $b_{\text{KV-read}}(T) = T \cdot b_{\text{KV-write}}$ with $b_{\text{KV-read}}^{\text{win}}(T) = \min(T, W) \cdot b_{\text{KV-write}}$ for window $W$. Caps KV traffic at a constant.
-\item[O3: Operator fusion (FlashAttention-style)~[5].] Eliminates the $O(T^2)$ $\mathbf{Q}\mathbf{K}^\top$ and softmax round-trips to HBM during prefill. Decode (Q of length 1) is already $O(T)$, so fusion's saving is concentrated on the prefill phase.
+\item[\textbf{O1:}] \textbf{KV quantization.} Reduce $e_{\text{KV}}$ from 2.0 (fp16) to 1.0 (int8) or 0.5 (int4). Reduces $b_{\text{KV}}$ proportionally and defers tier migration by the same factor.
+\item[\textbf{O2:}] \textbf{Sliding-window attention.} Replace $b_{\text{KV-read}}(T) = T \cdot b_{\text{KV-write}}$ with $b_{\text{KV-read}}^{\text{win}}(T) = \min(T, W) \cdot b_{\text{KV-write}}$ for window $W$. Caps KV traffic at a constant.
+\item[\textbf{O3:}] \textbf{Operator fusion (FlashAttention-style)~[5].} Eliminates the $O(T^2)$ $\mathbf{Q}\mathbf{K}^\top$ and softmax round-trips to HBM during prefill. Decode (Q of length 1) is already $O(T)$, so fusion's saving is concentrated on the prefill phase.
 \end{description}
-
 % ─────────────────────────────────────────────────────────────────────────
 \section{Adaptive KV-Placement Policy}
 \label{sec:adaptive}
@@ -284,7 +283,7 @@ Each model is wrapped in its native chat template before tokenization (ChatML fo
 
 \subsection{Reproducibility}
 
-All sampling is greedy ($T=0$); seeds are pinned to $\{42, 1337, 2024\}$. Outputs are GPU-tagged so dual-GPU runs do not overwrite each other. Code, model-download URLs, and reproduction instructions are at \url{https://github.com/mahima110298/llama.cpp}.
+All sampling is greedy ($T=0$); seeds are pinned to $\{42, 1337, 2024\}$. Outputs are GPU-tagged so dual-GPU runs do not overwrite each other. Code, model-download URLs, and reproduction instructions are at \url{https://github.com/mahima110298/Adaptive-KV-Cache-Placement-for-Tiered-Memory-LLM-Inference.git}.
 
 % ─────────────────────────────────────────────────────────────────────────
 \section{Experimental Setup and Results}
@@ -305,12 +304,12 @@ All sampling is greedy ($T=0$); seeds are pinned to $\{42, 1337, 2024\}$. Output
 
 Figure~\ref{fig:adaptive} shows the per-step latency profile around the HBM$\rightarrow$DRAM crossing for Llama-2-7B and TinyLlama-1.1B under both policies. For Llama-2-7B, the static policy produces a single tall stall at step 65{,}409 -- the bulk transfer of 32.4~GB at DRAM bandwidth, totaling 1011.8~ms in one step. The adaptive policy spreads the same work across $K=16$ preceding decode steps, reducing the worst-case step latency to 538.1~ms.
 
-\begin{figure}[H]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=0.95\linewidth]{figures/fig8_adaptive_vs_static.png}
+\includegraphics[width=\textwidth]{figures/fig8_adaptive_vs_static.png}
 \caption{Static vs.\ adaptive KV-placement at two tier boundaries. \emph{Right:} Llama-2-7B at the HBM$\rightarrow$DRAM crossing (32.4~GB migration). Static (red) pays the full migration cost in a single decode step (1011.8~ms); adaptive (green) spreads it across $K=16$ preceding steps, dropping the worst-case step to 538.1~ms (46.8\% reduction). \emph{Left:} TinyLlama-1.1B at the SRAM$\rightarrow$HBM crossing (4~MB migration). The two policies are indistinguishable, confirming the adaptive policy correctly adds zero overhead when the migration cost is already sub-millisecond -- a negative-control case.}
 \label{fig:adaptive}
-\end{figure}
+\end{figure*}
 
 Table~\ref{tab:adaptive} reports the headline metrics. The 46.8\% tail-latency reduction comes \emph{at zero overhead on total decode time} -- the same migration bytes are moved, just rescheduled. Note that the post-crossing steady-state latency ($\sim$500~ms per step at the new tier's bandwidth) is unchanged; the policy only eliminates the \emph{stall at the boundary}, not the structural cost of the slower tier itself.
 
@@ -509,7 +508,6 @@ We acknowledge the following:
 \item \emph{Adaptive policy is simulator-only.} We do not modify \texttt{llama.cpp}'s C++ to implement the policy in production; the analyzer post-processes a real or synthetic decode trace. A production implementation would require a CUDA kernel that copies KV blocks across PCIe in the background of the decode kernel.
 \item \emph{No measured tier migrations.} The largest real run (4096 tokens) does not approach the HBM boundary on the GPUs we have. The headline adaptive-vs-static comparison is on a synthetic decode trace where the simulator drives the KV size to 65{,}792 tokens.
 \item \emph{No batching.} All runs use $\text{batch}{=}1$. Real serving systems batch decode steps across users, partially amortizing weight reads. The adaptive policy generalizes to batched decode with no structural change.
-\item \emph{Two GPU classes only.} Adding a third (e.g., L4) would strengthen the cross-bandwidth analysis; we did not have time to provision a third runtime under the deadline.
 \item \emph{Energy figures are derived from published per-byte and per-MAC numbers}, not measured power draw. The qualitative conclusion (memory $\gg$ compute) is robust to large changes in those constants.
 \item \emph{Per-step runtime overhead at small model sizes.} For SmolLM2 ($\sim$135~MB bytes/step), the fixed Python/C++/kernel-launch cost is a meaningful share of the decode budget, weakening the bandwidth-tracking signal in the cross-bandwidth experiment (Sec.~\ref{sec:results-cross}). The memory-bound argument is cleanest at $\geq$1~B parameters; we report the small-model numbers transparently rather than excluding them.
 \end{enumerate}
@@ -530,7 +528,7 @@ We complemented the contribution with cross-bandwidth empirical validation acros
 \item \emph{Batched decode.} Extend the simulator to model multiple concurrent KV-caches and the cross-tenant scheduling problem that emerges.
 \end{itemize}
 
-The artefact is a single Colab notebook executable end-to-end on a Pro-tier runtime in $\sim$15~min, published at \url{https://github.com/mahima110298/llama.cpp}.
+The artefact is a single Colab notebook executable end-to-end on a Pro-tier runtime, published at \url{https://github.com/mahima110298/Adaptive-KV-Cache-Placement-for-Tiered-Memory-LLM-Inference.git}.
 
 \textbf{REFERENCES}
 
