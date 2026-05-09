@@ -18,15 +18,17 @@
        Halving Tail Latency at HBM-to-DRAM Crossings}
 
 \author{\IEEEauthorblockN{Mahima Sachan, Sarah Pradhan, Sahil Vanjara}
-\IEEEauthorblockA{Department of computer Science and Engineering\\
+\IEEEauthorblockA{Department of Computer Science and Engineering\\
 California State University, Long Beach\\
+CECS 530: Advanced Computer Architecture\\
+May 9, 2026 \\
 Mahima.Sachan01@student.csulb.edu, Sarah.Pradhan01@student.csulb.edu, Sahil.Vanjara01@student.csulb.edu,}}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-Large Language Model (LLM) inference is bottlenecked by memory traffic, not arithmetic. Under capacity pressure, the key/value (KV) cache eventually exceeds the on-package HBM and must spill to off-package DRAM or a disaggregated CXL pool. The static placement policy used by current open-source inference engines (vLLM, llama.cpp) reacts to this crossing with a single bulk migration, stalling one decode step by hundreds of milliseconds and breaking the per-token latency Service-Level Agreements (SLAs) that interactive chat workloads require. We propose an \emph{adaptive KV-placement policy} that predicts the imminent crossing from observed growth rate and pre-migrates the cache incrementally over the previous $K$ decode steps. Total decode work is preserved; the win is in tail latency. We implement the policy as a post-hoc analyzer over a four-tier memory simulator (SRAM/HBM/DRAM/FAR\_MEM) integrated as a modified inference pipeline atop \texttt{llama-cpp-python}. On Llama-2-7B at the HBM$\rightarrow$DRAM boundary ($\sim$32~GB KV-cache), adaptive placement with $K=16$ reduces the worst-case decode-step latency from $1011.8$~ms to $538.1$~ms -- a $\mathbf{46.8\%}$ reduction -- with no impact on total inference time. We complement this contribution with cross-bandwidth empirical validation across two NVIDIA accelerators spanning a $4.86\times$ HBM-bandwidth ratio (A100-SXM4-40GB at 1.555 TB/s, T4 at 0.32 TB/s) on three Q4-quantized models. Llama-2-7B's measured throughput tracks the bandwidth ratio at $4.21\times$ (87\% of the predicted scaling); smaller models track less faithfully, indicating that non-bandwidth runtime overhead becomes a meaningful share of the per-step budget below the billion-parameter scale. We further quantify three orthogonal traffic-reduction techniques (KV quantization, sliding-window attention, FlashAttention-style fusion) under a unified bytes-per-token cost model. All artifacts are reproducible end-to-end via a single Colab notebook.
+Autoregressive Large Language Model (LLM) decoding often operates near the memory-bandwidth roofline rather than the peak-compute roofline. As contexts grow, the key/value (KV) cache can outgrow on-package GPU memory and require placement in a lower-bandwidth tier such as host DRAM or CXL-attached memory. A capacity-reactive placement policy concentrates the migration cost at the boundary step, creating a tail-latency spike even though the total bytes moved are unchanged. This paper evaluates an \emph{adaptive KV-placement policy} that predicts an imminent tier crossing from KV growth and pre-migrates the cache over the previous $K$ decode steps. We implement the policy as a post-hoc analyzer over a four-tier memory simulator (SRAM/HBM/DRAM/FAR\_MEM) coupled to a modified \texttt{llama-cpp-python} inference pipeline. On Llama-2-7B at the HBM$\rightarrow$DRAM boundary ($\sim$32~GB KV-cache), adaptive placement with $K=16$ reduces the worst-case decode-step latency from $1011.8$~ms to $538.1$~ms, a $\mathbf{46.8\%}$ reduction, with no measured change in total decode time. We also validate the memory-bound trend on two NVIDIA accelerators with a $4.86\times$ HBM-bandwidth ratio (A100-SXM4-40GB at 1.555~TB/s and T4 at 0.32~TB/s) and three Q4-quantized models. Llama-2-7B's measured throughput ratio is $4.21\times$ (87\% of the bandwidth-ratio prediction), while smaller models show weaker scaling because fixed runtime overhead is a larger fraction of each decode step. Finally, we compare KV quantization, sliding-window attention, and FlashAttention-style fusion under a common bytes-per-token model. The complete artifact is packaged as a single Colab notebook.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -36,18 +38,18 @@ Tiered memory, LLM inference, KV-cache, adaptive placement, HBM, CXL, tail laten
 % ─────────────────────────────────────────────────────────────────────────
 \section{Introduction}
 
-The performance ceiling of modern LLM inference is set by memory bandwidth, not arithmetic throughput. An autoregressive decode step reads the entire weight tensor and the entire KV-cache once per generated token, producing an arithmetic intensity (AI) approximately equal to $2 \cdot N_{\text{params}} / b_{\text{weights}}$. For Q4-quantized open models we measure AI in the range 2--3 FLOP/byte across the entire model size range we test, two orders of magnitude below the rooflines of every modern accelerator. Compute units stall on memory; adding more compute is provably useless until the memory wall is addressed.
+Autoregressive LLM decoding is commonly limited by memory movement rather than by the accelerator's advertised floating-point throughput. Each decoded token streams model weights and reads the KV-cache state accumulated so far; in a roofline view, this gives an arithmetic intensity (AI) near $2 \cdot N_{\text{params}} / b_{\text{weights}}$ for the weight-dominated portion of decode. On the Q4-quantized models in our experiments, the measured AI falls in the 2--3~FLOP/byte range, far below the ridge points of the tested GPUs and consistent with prior memory-centric analyses of LLM inference~[1], [2], [8].
 
-A second source of memory pressure is the KV-cache, which grows linearly in tokens, layers, and KV-heads. For Llama-2-7B at 65{,}000 tokens, the cache reaches $\sim$32~GB -- the full HBM budget of an A100-40GB. Beyond this point the cache must be tiered into off-package DRAM or, eventually, a disaggregated CXL pool. The two open-source inference engines that dominate practical LLM serving today (vLLM~[3] and llama.cpp~[6]) treat this transition reactively: when the cache cannot fit, a bulk transfer to the next tier is triggered \emph{at the crossing step}. That single step pays the full migration cost, which on standard hardware is hundreds of milliseconds.
+The KV-cache adds a second, context-length-dependent pressure point. Its size grows linearly with the number of tokens, layers, and KV heads. For Llama-2-7B~[14], a context near 65{,}000 tokens produces a KV-cache of roughly 32~GB in the simulator, which is close to the capacity threshold we reserve for HBM after accounting for weights and runtime buffers. Past this threshold, cache blocks must be modeled in a lower-bandwidth tier such as host DRAM or a CXL-attached pool. Our static baseline abstracts representative capacity-reactive behavior in engines such as vLLM and \texttt{llama.cpp}: cache placement changes only after the current tier can no longer hold the cache, so migration work is charged to the crossing step~[3], [6].
 
-For interactive workloads -- chat, coding assistants, agentic loops -- this single-step stall directly breaks the per-token p99 SLAs that production deployments target ($\sim$50~ms). It also decouples the latency profile from the underlying arithmetic, since one outlier step dominates user-visible quality. We argue that capacity-aware placement should therefore be \emph{adaptive}: the runtime should predict the imminent crossing and pre-migrate the cache incrementally over preceding decode steps, smoothing the cost rather than concentrating it in a single stall.
+For human-facing generation workloads such as chat, coding assistants, and tool-using agents, inter-token latency and tail latency are part of the user-visible service budget. A boundary step that pays hundreds of milliseconds of migration cost can dominate the perceived latency profile even if the average decode cost remains unchanged. We therefore study a capacity-aware policy that predicts the tier crossing from KV growth and starts migration before the boundary, spreading the same bytes over earlier decode steps instead of concentrating them in one stall.
 
 \textbf{This paper makes the following contributions:}
 
 \begin{itemize}
-\item \textbf{An adaptive KV-cache placement policy} parameterised by a lookahead window $K$ that pre-migrates the cache before HBM exhaustion. We compare it directly to the static policy used by current open-source engines. On Llama-2-7B at the HBM$\rightarrow$DRAM crossing, adaptive placement at $K=16$ reduces the worst-case decode-step latency from \textbf{1011.8 ms to 538.1 ms (46.8\% reduction)} with no impact on total decode time. (Section~\ref{sec:adaptive}, Sec.~\ref{sec:results-adaptive}.)
+\item \textbf{An adaptive KV-cache placement policy} parameterised by a lookahead window $K$ that begins migration before HBM exhaustion. We compare it with a capacity-reactive static baseline inspired by the placement behavior exposed by current open-source runtimes~[3], [6]. On Llama-2-7B at the HBM$\rightarrow$DRAM crossing, adaptive placement at $K=16$ reduces the worst-case decode-step latency from \textbf{1011.8 ms to 538.1 ms (46.8\% reduction)} with no impact on total decode time. (Section~\ref{sec:adaptive}, Sec.~\ref{sec:results-adaptive}.)
 \item \textbf{A four-tier hierarchical memory simulator} (SRAM, HBM, DRAM, FAR\_MEM) integrated as a modified inference pipeline atop \texttt{llama-cpp-python}, providing capacity-aware placement, migration tracking, bandwidth-bound latency, and per-byte energy modeling. The pipeline drives both the static policy (baseline) and our adaptive policy. (Section~\ref{sec:design}, Section~\ref{sec:impl}.)
-\item \textbf{Cross-bandwidth empirical validation} across two NVIDIA accelerators spanning a $4.86\times$ HBM-bandwidth ratio (A100-SXM4-40GB, T4). Measured throughput ratio matches the bandwidth ratio within 11\% on Llama-2-7B, supporting the central memory-bound thesis on real hardware. (Sec.~\ref{sec:results-cross}.)
+\item \textbf{Cross-bandwidth empirical validation} across two NVIDIA accelerators spanning a $4.86\times$ memory-bandwidth ratio (A100-SXM4-40GB, T4) using vendor-published hardware specifications~[16], [17]. Measured throughput ratio matches the bandwidth ratio within 13\% on Llama-2-7B, supporting the memory-bound interpretation on real hardware. (Sec.~\ref{sec:results-cross}.)
 \item \textbf{A unified bytes-per-token comparison} of KV quantization, sliding-window attention, and FlashAttention-style fusion -- across all three models. Sliding-window $W=512$ delivers the largest reduction (30\%) for Llama-2-7B at our test context. (Sec.~\ref{sec:results-opt}.)
 \item \textbf{A reproducible, single-notebook artifact.} The complete code (simulator, pipeline, experiments, figures) executes end-to-end on a Colab Pro A100 and is published as a public GitHub repository.
 \end{itemize}
@@ -57,9 +59,9 @@ For interactive workloads -- chat, coding assistants, agentic loops -- this sing
 
 \subsection{Memory-Bound LLM Inference}
 
-The Roofline model of Williams et~al.~[1] places a workload's measured performance against a piecewise-linear ceiling defined by peak compute and peak memory bandwidth. The ridge point separates compute-bound from memory-bound regimes; for an A100-SXM4-40GB at 312 BF16-TFLOPS and 1.555 TB/s HBM, the ridge sits near 200 FLOP/byte. We measure the AI of dense decoder-only decode in the 2--3 FLOP/byte range, two orders of magnitude below.
+The Roofline model of Williams et~al.~[1] compares measured performance with a piecewise-linear ceiling determined by peak compute and peak memory bandwidth. The ridge point separates compute-bound and bandwidth-bound operating regions. Using NVIDIA's published A100-SXM4-40GB specifications (312~BF16/FP16 Tensor TFLOP/s and 1.555~TB/s HBM bandwidth), the ridge is approximately 200~FLOP/byte~[16]. Our dense decoder-only measurements cluster around 2--3~FLOP/byte, well below that ridge.
 
-Sheng et~al.~[2] (FlexGen) demonstrated that weight-stationary scheduling fails at batch-size-one autoregressive generation, the canonical interactive deployment. Gholami et~al.~[8] (``AI and the Memory Wall'') tracked the divergence: model parameters have grown $410\times$ in two years while HBM bandwidth grew only $2.1\times$.
+Prior LLM-serving work reaches the same qualitative conclusion from different angles. FlexGen showed that weight-stationary scheduling is poorly matched to batch-size-one autoregressive generation~[2]. Gholami et~al. describe the widening gap between model-size growth and memory-bandwidth growth, which motivates treating bandwidth as a first-order inference bottleneck~[8].
 
 \subsection{KV-Cache Management}
 
@@ -67,7 +69,7 @@ The KV-cache has become a first-class resource. PagedAttention~[3] introduced vi
 
 \subsection{Tiered and Disaggregated Memory Hardware}
 
-HBM3 sustains $\sim$3.35 TB/s per stack at $\sim$10 ns latency~[7]. Off-package DDR5 reaches $\sim$68 GB/s at 80 ns. CXL 3.0~[11] specifies cache-coherent memory expansion at $\sim$25 GB/s per port with $\sim$500 ns latency. The bandwidth gap between HBM and CXL exceeds $130\times$, an order of magnitude larger than the gap between HBM and SRAM. Maruf et~al.~[4] showed CXL pools are viable for capacity-bound, latency-tolerant workloads such as key-value stores; we quantify the per-decode-step penalty for interactive LLM generation, which has stricter latency constraints.
+The simulator uses representative tier parameters rather than a single commercial node. For the HBM tier we use a modern accelerator-class bandwidth of 3.35~TB/s, consistent with H100-class HBM3 subsystems, while the measured A100 experiments use the A100's 1.555~TB/s bandwidth~[16], [18]. The DRAM tier is modeled with DDR5-class bandwidth (68~GB/s), and the far-memory tier uses a CXL-attached pool with substantially lower effective bandwidth and higher access latency~[11], [19]. Under these assumptions, the HBM-to-CXL bandwidth ratio is greater than $130\times$. Prior work such as TPP shows that CXL pools can help capacity-bound, latency-tolerant workloads~[4]; our focus is the decode-step penalty in an interactive LLM setting.
 
 \subsection{Tail-Latency-Aware Memory Tiering}
 
@@ -75,7 +77,7 @@ Outside the LLM context, tail-latency-aware memory tiering has a substantial bod
 
 \subsection{The Modified-Pipeline Choice}
 
-Section~8 of the project brief permits three implementation approaches: a pure analytical simulator, a modified inference pipeline with explicit memory placement, or an analytical model validated against measurements. We chose the modified pipeline because (i) wrapping a real runtime preserves end-to-end functional correctness, (ii) it lets us validate the analytical traffic model against real wall-clock latencies on real hardware, and (iii) it produces figures that any reader can re-derive by re-running a single Colab notebook.
+We implement our proposed policy using a modified inference pipeline with explicit memory placement. This approach is preferred over a purely analytical simulation for three reasons: (i) wrapping a real runtime preserves end-to-end functional correctness, (ii) it enables validation of the analytical traffic model against real wall-clock latencies on physical hardware, and (iii) it produces reproducible results that can be verified via a single, integrated Colab notebook.
 
 % ─────────────────────────────────────────────────────────────────────────
 \section{System Architecture}
@@ -112,13 +114,13 @@ T3 CXL 3.0 & 25 GB/s   & 500 ns & 512 GB & Disaggregated pool, cold KV \\
 
 \subsection{Static Placement Policy (Baseline)}
 
-Our baseline mirrors the placement logic of current open-source inference engines:
+Our baseline is a capacity-reactive policy consistent with the placement abstractions exposed by current open-source inference engines, but simplified so the migration cost is explicit:
 \begin{itemize}
 \item \textbf{Weights} are placed in the fastest tier with capacity $\geq w_{\text{bytes}}$, skipping Tier~0 (no real LLM weight tensor fits in 4~MB).
-\item \textbf{KV-cache} is placed in the fastest tier with capacity $\geq k_{\text{bytes}}(t)$ at the current decode step. As the cache grows, it migrates downward; \emph{the migration is triggered at the step at which capacity is exceeded}.
+\item \textbf{KV-cache} is placed in the fastest tier with capacity $\geq k_{\text{bytes}}(t)$ at the current decode step. As the cache grows, the baseline moves it to the next tier only when the capacity test fails; \emph{the modeled migration is therefore charged at the crossing step}.
 \item \textbf{Compute buffers} (activations, attention intermediates, logits) live in Tier~0, consistent with FlashAttention-style tiling.
 \end{itemize}
-The static policy's defining property is that the cost of the bulk migration -- $\tau_{\text{mig}} = k_{\text{bytes}}/B(\textsc{tier}_{\text{dest}})$ -- is paid in full at a single decode step. For Llama-2-7B at the HBM$\rightarrow$DRAM crossing this is $32.4\,\text{GB}/68\,\text{GB/s} \approx 476$~ms in a single stall, on top of that step's normal decode time.
+The static policy's defining property is not the total number of bytes moved, but the timing of those bytes. It charges the bulk migration, $\tau_{\text{mig}} = k_{\text{bytes}}/B(\textsc{tier}_{\text{dest}})$, to one decode step. For Llama-2-7B at the HBM$\rightarrow$DRAM crossing this is $32.4\,\text{GB}/68\,\text{GB/s} \approx 476$~ms, added to the normal latency of that step.
 
 \subsection{Bytes per Decode Step}
 
@@ -156,7 +158,7 @@ We model three traffic-reduction techniques:
 
 \subsection{Motivation}
 
-Under the static placement policy of Sec.~\ref{sec:design}, the migration of a 32~GB KV-cache from HBM to DRAM at 68~GB/s costs $\sim$476~ms in a single decode step. On Llama-2-7B at the crossing, that step's total latency reaches \textbf{1011.8~ms} (Sec.~\ref{sec:results-adaptive}) -- two orders of magnitude above the per-token p99 SLAs of interactive applications. After the crossing, every subsequent decode step also pays the slower DRAM bandwidth for KV reads, but \emph{that cost is structural to the placement, not to the policy}. The question this paper raises is: can the cost of the migration itself be eliminated, even if the steady-state cost cannot?
+Under the static placement policy of Sec.~\ref{sec:design}, moving a 32~GB KV-cache from HBM to DRAM at 68~GB/s adds roughly 476~ms to the boundary step. In the Llama-2-7B crossing experiment, that step reaches \textbf{1011.8~ms} (Sec.~\ref{sec:results-adaptive}). Subsequent steps still pay the slower DRAM bandwidth for KV reads; adaptive placement does not change that steady-state cost. The policy target is narrower: remove the extra migration spike at the boundary by scheduling the transfer earlier.
 
 \subsection{Mechanism}
 
@@ -172,7 +174,7 @@ n_{\text{overflow}} = \lceil (C(\textsc{tier}) - k_{\text{cur}}) / \Delta k \rce
 \item At the crossing step, the cache is already resident in the destination tier; no in-line bulk transfer is required.
 \end{enumerate}
 
-The policy is purely additive: the migration work is the same $k_{\text{cur}}$ bytes, just \emph{rescheduled}. Total decode time is preserved within rounding (we measure 0.0\% total-time overhead, Sec.~\ref{sec:results-adaptive}). The win is in tail latency at the boundary.
+The policy does not reduce the migration volume; it changes only when the same $k_{\text{cur}}$ bytes are copied. In the simulated traces, total decode time is unchanged within rounding (0.0\% overhead in Sec.~\ref{sec:results-adaptive}), while the maximum boundary-step latency decreases.
 
 \subsection{Pseudo-Code}
 
@@ -195,7 +197,7 @@ def analyze_static_vs_adaptive(sim, K=16):
 
 \subsection{Why Adaptive Placement Is the Right Lever}
 
-Migration and placement policy is a core deliverable of this work. The static policy is a degenerate placement policy -- it has no notion of when to migrate; it just reacts. The adaptive policy makes the temporal scheduling of migration an explicit design parameter. We show in Sec.~\ref{sec:results-adaptive} that this single parameter ($K$) governs the entire tail-latency profile at tier crossings, and that the cost of choosing it well is zero.
+The placement decision has both a spatial component (which tier stores the cache) and a temporal component (when migration begins). The static baseline fixes the temporal component at the crossing step. The adaptive policy exposes it through $K$, making the boundary-latency profile tunable while preserving the same total migration work. Sec.~\ref{sec:results-adaptive} reports how this affects the tail-latency profile at tier crossings.
 
 % ─────────────────────────────────────────────────────────────────────────
 \section{Implementation}
@@ -224,7 +226,7 @@ decode_ms = (time.perf_counter() - t_d)*1000
 
 \subsection{Hardware}
 
-We collected real measurements on two NVIDIA accelerators provisioned via Google Colab Pro. Table~\ref{tab:hw} summarizes the configuration. The 4.86$\times$ HBM-bandwidth ratio is the central design lever for the cross-bandwidth validation in Sec.~\ref{sec:results-cross}.
+We collected real measurements on two NVIDIA accelerators provisioned via Google Colab Pro. Table~\ref{tab:hw} summarizes the configuration using vendor-published peak specifications for memory bandwidth and tensor throughput~[16], [17]. The 4.86$\times$ memory-bandwidth ratio is the central design lever for the cross-bandwidth validation in Sec.~\ref{sec:results-cross}.
 
 \begin{table}[H]
 \caption{Cross-Bandwidth Hardware Configuration}
@@ -238,7 +240,7 @@ We collected real measurements on two NVIDIA accelerators provisioned via Google
 \hline
 \textbf{Property} & \textbf{A100-SXM4-40GB} & \textbf{Tesla T4} \\
 \hline
-Peak BF16/FP16 (TFLOPS) & 312 & 65 \\
+Peak tensor FP16/BF16 where available (TFLOPS) & 312 & 65 \\
 \hline
 HBM bandwidth (TB/s) & 1.555 & 0.32 \\
 \hline
@@ -251,7 +253,7 @@ Roofline ridge (FLOP/B) & 200 & 203 \\
 
 \subsection{Models}
 
-We use three open Q4\_K\_M GGUF checkpoints (Table~\ref{tab:models}). Q4\_K\_M is the de-facto \texttt{llama.cpp} weight quantization; it stores weights at $\sim$4.5 bits per element with grouped scales.
+We use three open GGUF checkpoints quantized with Q4\_K\_M (Table~\ref{tab:models}). Q4\_K\_M is a block-based \texttt{llama.cpp}/GGUF weight-quantization format; the effective on-disk model size includes quantized weights plus per-block scale and metadata overhead~[6], [24].
 
 \begin{table}[H]
 \caption{Models Under Test (all Q4\_K\_M)}
@@ -279,7 +281,7 @@ Llama-2-7B      & 32 & 32 & 32 & 4096 & 4.08 GB \\
 
 \subsection{Chat Templating}
 
-Each model is wrapped in its native chat template before tokenization (ChatML for SmolLM2, the Zephyr-style format for TinyLlama, and the Llama-2 \texttt{[INST]} wrapper for Llama-2-7B). Without this wrapper, the instruction-tuned models emit end-of-sequence on raw input prompts, producing empty decode traces. The template strings are taken from the respective model cards; we do not modify the underlying weights or tokenizers.
+Each model is wrapped in its documented chat template before tokenization: ChatML-style markers for SmolLM2, the Zephyr-style format used by TinyLlama-1.1B-Chat, and the Llama-2 \texttt{[INST]} wrapper for Llama-2-Chat~[20]--[23]. Without this wrapper, the instruction-tuned checkpoints can terminate immediately on raw prompts, producing empty decode traces. The template strings are taken from the published tokenizer configuration or model cards; the weights and tokenizers are otherwise unchanged.
 
 \subsection{Reproducibility}
 
@@ -295,8 +297,6 @@ All sampling is greedy ($T=0$); seeds are pinned to $\{42, 1337, 2024\}$. Output
 \textbf{Simulator-only sweep:} 3 models $\times$ 8 contexts (128 to $2{,}097{,}152$ tokens) $\times$ 3 KV-quants (16, 8, 4 bits).\\
 \textbf{Optimization comparison:} 5 variants $\times$ 3 models, all at ctx~$=4096$.\\
 \textbf{Adaptive vs static:} 2 models (TinyLlama-1.1B, Llama-2-7B) at the smallest context that forces an HBM$\rightarrow$DRAM crossing ($\sim$65{,}792 tokens for 7B).
-
-\textbf{Data quality.} An initial run with raw, untemplated prompts produced empty decodes for SmolLM2 (short-prompt seeds) and TinyLlama (all seeds), since both are instruction-tuned models that emit end-of-sequence on inputs that do not match their respective chat templates (ChatML for SmolLM2, Zephyr-style for TinyLlama). After applying each model's chat template before tokenization (Sec.~\ref{sec:impl}), \textbf{all 108 runs (3 models $\times$ 9 cells $\times$ 2 GPUs) decode successfully}, with the maximum 150 generated tokens per cell. The 46.8\% adaptive-policy headline is independent of this fix, as it is computed from a synthetic decode trace driven by the simulator.
 
 % ─────────────────────────────────────────────────────────────────────────
 \subsection{Adaptive vs.\ Static KV-Placement (Headline)}
@@ -343,7 +343,7 @@ For TinyLlama-1.1B at the smaller SRAM$\rightarrow$HBM boundary (KV at crossing 
 
 Figure~\ref{fig:roofline} places every measured decode step on the host roofline. AI clusters at 2.5--3.3~FLOP/byte across all three models on both A100 and T4, two orders of magnitude below the respective ridge points (200 and 203~FLOP/byte).
 
-Table~\ref{tab:cross-bw} summarises the cross-bandwidth tracking. The expected behaviour under a strictly memory-bound workload is that measured throughput scales with the HBM-bandwidth ratio ($1.555 / 0.32 = 4.86\times$). Llama-2-7B tracks this prediction at $4.21\times$ -- 87\% of the bandwidth ratio. The smaller models do \emph{not}: TinyLlama tracks at $2.22\times$ and SmolLM2 at only $1.60\times$. We interpret this as evidence that for sub-billion-parameter models, bytes-per-step are small enough that per-call overhead in the runtime (Python$\leftrightarrow$C++ FFI, kernel launch, sampling, scheduling) becomes a meaningful share of the per-step budget, partially de-coupling throughput from raw HBM bandwidth. The memory-bound argument therefore strengthens with model size, and Llama-2-7B is the cleanest empirical confirmation we have.
+Table~\ref{tab:cross-bw} summarises the cross-bandwidth tracking. If decode were perfectly bandwidth-bound, measured throughput would scale with the memory-bandwidth ratio ($1.555 / 0.32 = 4.86\times$). Llama-2-7B reaches a $4.21\times$ A100/T4 throughput ratio, or 87\% of that prediction. TinyLlama and SmolLM2 scale less strongly ($2.22\times$ and $1.60\times$ respectively). We interpret the gap as fixed per-step overhead---Python$\leftrightarrow$C++ calls, kernel launches, sampling, and scheduler work---becoming more visible when the bytes moved per step are small. The largest model is therefore the cleanest empirical case for the memory-bound interpretation.
 
 \begin{table}[H]
 \caption{Cross-Bandwidth Throughput Tracking}
@@ -452,7 +452,7 @@ Figure~\ref{fig:bpt} shows per-token memory traffic across the three models in o
 
 \subsection{Energy per Token}
 
-Figure~\ref{fig:energy} stacks per-token energy contributions of weight reads, KV reads (at ctx~$=2048$), and MAC operations. Across all three models the memory contribution exceeds the compute contribution by $>$2 orders of magnitude. Reducing bytes moved is the single highest-leverage optimization for energy efficiency.
+Figure~\ref{fig:energy} stacks per-token energy contributions of weight reads, KV reads (at ctx~$=2048$), and MAC operations. Across all three models, the modeled memory contribution exceeds the compute contribution by more than two orders of magnitude. Under this model, reducing bytes moved is the highest-leverage optimization for energy efficiency.
 
 \begin{figure}[H]
 \centering
@@ -479,23 +479,23 @@ Figure~\ref{fig:val} scatters modeled decode time against measured decode time o
 
 The adaptive policy delivers a 46.8\% tail-latency reduction at the HBM$\rightarrow$DRAM crossing for Llama-2-7B, and zero benefit at the SRAM$\rightarrow$HBM crossing for TinyLlama. This is exactly what the analytical model predicts: the adaptive win equals the migration cost spread over $K$ steps, divided by the per-step decode latency. When the migration is small (SRAM crossing, $\sim$4~MB at 10~TB/s = 0.4~$\mu$s), there is nothing to amortize. When the migration is large (HBM crossing, $\sim$32~GB at 68~GB/s = 476~ms), the amortization is everything.
 
-The implication for system design is direct: \textbf{adaptive placement is necessary precisely where bandwidth gaps between adjacent tiers are widest}. The HBM$\rightarrow$DRAM gap is $\sim$50$\times$; the DRAM$\rightarrow$CXL gap is another $\sim$2.7$\times$. Both gaps are large enough to break interactive SLAs at the migration step. The static policy used by current open-source engines is correct only when migrations are negligible; under the long-context workloads the industry is racing toward, that assumption fails by orders of magnitude.
+The system-design implication is that adaptive placement is most useful at wide bandwidth discontinuities. In our tier model, HBM$\rightarrow$DRAM is roughly a $50\times$ bandwidth drop, and DRAM$\rightarrow$CXL adds another $\sim$2.7$\times$ drop. A capacity-reactive baseline is acceptable when migration is small enough to be hidden in a decode step; at long contexts, the same assumption no longer holds.
 
 \subsection{Why LLM Decode is Structurally Memory-Bound}
 
-Two structural features force memory-boundedness regardless of the underlying accelerator. First, weights are read \emph{once per token}, not amortized across a batch -- the autoregressive constraint forbids overlap along the sequence dimension at batch~1. Second, the KV-cache grows linearly in tokens, layers, and KV-heads, and is read in full at every step. Both quantities scale with model size; arithmetic per token scales at the same rate. The ratio (AI) is therefore approximately constant near 2--3~FLOP/byte, independent of model size, which explains the clustering observed in Fig.~\ref{fig:roofline}.
+Two decode properties make memory movement a persistent constraint. First, at batch~1 the weight stream is not amortized across many simultaneous tokens; each output token requires another pass over the weights. Second, the KV-cache grows with tokens, layers, and KV heads, and attention reads the relevant cache state during decode. Arithmetic grows with model size as well, so the ratio captured by AI remains near 2--3~FLOP/byte in our measurements, explaining the clustering in Fig.~\ref{fig:roofline}.
 
-The cross-bandwidth experiment substantiates this empirically: T4's measured throughput is 4.34$\times$ slower than A100's, against a 4.86$\times$ HBM-bandwidth ratio (89\% match). Were the workload compute-bound, we would expect tracking with the TFLOPS ratio (which happens to also be $\sim$4.8$\times$ in this pair, so this single comparison cannot disentangle the two effects -- but the consistency of AI across both hosts is itself diagnostic).
+The cross-bandwidth experiment is consistent with this view. Llama-2-7B runs $4.21\times$ faster on A100 than on T4, while the published memory-bandwidth ratio is $4.86\times$ (87\% match). This pair of GPUs has a similar ratio for tensor-core peak throughput, so bandwidth and compute ratios are not fully separable from this comparison alone; the low measured AI and the poorer scaling of smaller models provide the stronger evidence for the memory-bound diagnosis.
 
 \subsection{Why the Memory-Bound Prediction Is Off by 2$\times$ (and Why the Gap Widens for Smaller Models)}
 
-Our memory-bound prediction is $\text{tps} = B_{\text{HBM, peak}} / b_{\text{tot}}$. For Llama-2-7B, measurements come in at $\sim$45\% of this prediction on both A100 and T4 -- consistent with the kernel-level fact that real attention and MLP kernels achieve $\sim$40--60\% of peak HBM bandwidth in published \texttt{llama.cpp} benchmarks~[6]. The fact that the same fractional gap appears on both GPUs supports the diagnosis that the model is correctly identifying the bottleneck.
+Our memory-bound prediction is $\text{tps} = B_{\text{HBM, peak}} / b_{\text{tot}}$. For Llama-2-7B, measurements reach roughly 45\% of this idealized prediction on both A100 and T4. We treat this as expected implementation loss: the analytical model assumes full use of peak bandwidth and no launch, scheduling, or pipeline overhead, while real kernels and runtime stacks do not sustain the theoretical peak for every decode step. The similar fractional gap across the two GPUs supports the interpretation that the model is identifying the right bottleneck even though it remains optimistic in absolute throughput.
 
-For smaller models the gap widens: the memory-bound prediction overestimates by 4.4$\times$ for TinyLlama and by 30$\times$ for SmolLM2 on A100. We attribute this to runtime overhead per decode step that does not scale with model size: each step incurs a fixed cost in Python$\leftrightarrow$C++ FFI, kernel-launch latency, sampling, and bookkeeping. For Llama-2-7B at $\sim$4.5~GB per step, this fixed cost is amortised; for SmolLM2 at $\sim$135~MB per step, it is comparable to the bandwidth-bound estimate itself. This is a methodological caveat for any memory-centric analysis at the sub-billion-parameter scale -- and an argument that the production-relevant target for memory-centric architecture work is the 7B--70B regime, not toy models.
+For smaller models the gap widens: the memory-bound prediction overestimates by 4.4$\times$ for TinyLlama and by 30$\times$ for SmolLM2 on A100. We attribute this to runtime overhead per decode step that does not scale with model size: each step incurs a fixed cost in Python$\leftrightarrow$C++ FFI, kernel-launch latency, sampling, and bookkeeping. For Llama-2-7B at $\sim$4.5~GB per step, this fixed cost is amortised; for SmolLM2 at $\sim$135~MB per step, it is comparable to the bandwidth-bound estimate itself. This is a methodological caveat for memory-centric analysis at the sub-billion-parameter scale and suggests that bandwidth-focused architecture studies should be evaluated on models large enough for fixed runtime overhead to be amortized.
 
 \subsection{The Cross-Bandwidth Result Strengthens with Model Size}
 
-Table~\ref{tab:cross-bw} shows that the A100/T4 measured-throughput ratio matches the HBM-bandwidth ratio (4.86$\times$) most closely for the largest model: 87\% for Llama-2-7B, 46\% for TinyLlama, 33\% for SmolLM2. This is the same phenomenon as the memory-bound prediction gap, viewed from the cross-bandwidth angle. The implication is positive for the paper's central thesis: \emph{the larger the model, the more dominant the memory bottleneck and the cleaner the bandwidth-tracking}. Modern frontier inference workloads (7B--70B+) are exactly the regime where the memory-centric architecture argument is sharpest.
+Table~\ref{tab:cross-bw} shows that the A100/T4 measured-throughput ratio matches the HBM-bandwidth ratio (4.86$\times$) most closely for the largest model: 87\% for Llama-2-7B, 46\% for TinyLlama, 33\% for SmolLM2. This is the same phenomenon as the memory-bound prediction gap, viewed from the cross-bandwidth angle. The trend supports the paper's main claim: as model size increases, fixed runtime overhead is amortized over more bytes per decode step, and bandwidth-tracking becomes clearer. This is the regime where memory-centric placement policies are most likely to matter.
 
 \subsection{Why KV-Quantization Looks Smaller Here Than Reported Elsewhere}
 
@@ -515,16 +515,14 @@ We acknowledge the following:
 % ─────────────────────────────────────────────────────────────────────────
 \section{Conclusion and Future Work}
 
-This paper makes the case for treating temporal scheduling of memory-tier migration as a first-class architectural lever in LLM inference. The static placement policy used by current open-source inference engines reacts to capacity exhaustion at the crossing step, paying a single full-migration stall that on Llama-2-7B reaches 1011.8~ms -- two orders of magnitude above interactive p99 SLAs. We proposed and evaluated an adaptive policy that pre-migrates the cache incrementally over the previous $K=16$ decode steps, reducing the worst-case step latency by 46.8\% with no impact on total decode time. The mechanism is simple ($\sim$30 lines of Python in the analyzer; a kernel-level implementation would be of comparable size) and the win is structural: it eliminates the single largest source of tail latency at the boundary.
+This paper treats the timing of memory-tier migration as an explicit design variable for LLM inference. In the static baseline, capacity exhaustion is handled at the crossing step, so the modeled HBM$\rightarrow$DRAM migration for Llama-2-7B contributes to a 1011.8~ms boundary step. The adaptive policy begins migration over the previous $K=16$ decode steps; in the simulated trace, this reduces the worst-case step latency by 46.8\% with no change in total decode time. The result suggests that temporal scheduling, even without reducing total bytes moved, can remove a major source of boundary-step tail latency.
 
-We complemented the contribution with cross-bandwidth empirical validation across two NVIDIA accelerators ($4.86\times$ HBM ratio), showing that measured throughput tracks the bandwidth ratio within 11\% on Llama-2-7B and that a compute-only prediction overestimates measured tok/s by two orders of magnitude on both hosts. We unified KV quantization, sliding-window attention, and operator fusion under a single bytes-per-token cost model and identified sliding-window $W=512$ as the largest single-optimization win at our test context.
+We complemented the policy study with cross-bandwidth measurements across two NVIDIA accelerators ($4.86\times$ memory-bandwidth ratio), showing that Llama-2-7B throughput reaches 87\% of the bandwidth-ratio prediction and that a compute-only throughput estimate overpredicts measured tok/s by two orders of magnitude on both hosts. We also placed KV quantization, sliding-window attention, and operator fusion under a single bytes-per-token model and found sliding-window $W=512$ to be the largest single optimization at the tested context length.
 
 \textbf{Future work:}
 \begin{itemize}
 \item \emph{Production implementation.} Port the adaptive policy into \texttt{llama.cpp}'s CUDA backend or vLLM's PagedAttention manager, so the in-flight migration overlaps with weight reads on real silicon.
 \item \emph{Online-learned $K$.} Replace the fixed lookahead with a controller that adjusts $K$ from observed decode-step latency variance.
-\item \emph{Disaggregated tier (Track C extension).} Apply the same adaptive analysis to the DRAM$\rightarrow$CXL crossing, where the migration cost is even larger.
-\item \emph{Compute-in-memory (Track A extension).} Folding the attention dot-product into the HBM die would eliminate the bandwidth bottleneck for KV reads entirely; it is complementary to adaptive placement.
 \item \emph{Batched decode.} Extend the simulator to model multiple concurrent KV-caches and the cross-tenant scheduling problem that emerges.
 \end{itemize}
 
@@ -544,7 +542,7 @@ The artefact is a single Colab notebook executable end-to-end on a Pro-tier runt
 
 [6] G. Gerganov et~al., ``llama.cpp: Efficient LLM Inference in C/C++,'' GitHub repository, 2023. [Online]. Available: \url{https://github.com/ggerganov/llama.cpp}
 
-[7] JEDEC, ``High Bandwidth Memory (HBM) DRAM Standard,'' JESD235D, 2023.
+[7] JEDEC, ``High Bandwidth Memory 3 (HBM3) DRAM Standard,'' JESD238, 2022.
 
 [8] A. Gholami, Z. Yao, S. Kim, C. Hooper, M. W. Mahoney, and K. Keutzer, ``AI and Memory Wall,'' \emph{IEEE Micro}, 2024.
 
@@ -561,5 +559,23 @@ The artefact is a single Colab notebook executable end-to-end on a Pro-tier runt
 [14] H. Touvron et~al., ``Llama 2: Open Foundation and Fine-Tuned Chat Models,'' \emph{arXiv:2307.09288}, 2023.
 
 [15] K. Lim, J. Chang, T. Mudge, P. Ranganathan, S. K. Reinhardt, and T. F. Wenisch, ``Disaggregated Memory for Expansion and Sharing in Blade Servers,'' in \emph{Proc.\ ACM ISCA}, 2009, pp.~267--278.
+
+[16] NVIDIA, ``NVIDIA A100 Tensor Core GPU Architecture,'' white paper, 2020. [Online]. Available: \url{https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf}
+
+[17] NVIDIA, ``NVIDIA T4 70W Low Profile PCIe GPU Accelerator,'' product brief, 2020. [Online]. Available: \url{https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-product-brief.pdf}
+
+[18] NVIDIA, ``NVIDIA H100 Tensor Core GPU,'' datasheet, 2023. [Online]. Available: \url{https://www.nvidia.com/en-us/data-center/h100/}
+
+[19] JEDEC, ``DDR5 SDRAM Standard,'' JESD79-5, 2020.
+
+[20] Hugging Face, ``Chat Templates,'' \emph{Hugging Face LLM Course}, 2024. [Online]. Available: \url{https://huggingface.co/learn/llm-course/en/chapter11/2}
+
+[21] HuggingFaceTB, ``SmolLM2-135M-Instruct,'' model card and tokenizer configuration, Hugging Face, 2024. [Online]. Available: \url{https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct}
+
+[22] TinyLlama Team, ``TinyLlama-1.1B-Chat-v1.0,'' model card, Hugging Face, 2023. [Online]. Available: \url{https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+
+[23] Meta Llama, ``Llama 2 Model Card,'' GitHub repository, 2023. [Online]. Available: \url{https://github.com/meta-llama/llama-models/blob/main/models/llama2/MODEL_CARD.md}
+
+[24] ggml-org, ``llama.cpp quantize tool,'' GitHub repository, 2024--2026. [Online]. Available: \url{https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md}
 
 \end{document}
