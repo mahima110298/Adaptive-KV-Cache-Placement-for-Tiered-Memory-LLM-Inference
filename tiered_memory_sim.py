@@ -444,3 +444,23 @@ def analyze_static_vs_adaptive(sim: TieredMemorySimulator,
             adaptive_lat[s] += per_step_bonus
 
     return static_lat, adaptive_lat, migrations
+
+
+if __name__ == "__main__":
+    _demo = ModelParams(
+        name="smoke-test",
+        n_layers=8,
+        n_kv_heads=4,
+        n_heads=4,
+        n_embd=256,
+        n_params=50_000_000,
+        weight_bytes=100 * 1024**2,
+    )
+    _sim = TieredMemorySimulator(model=_demo)
+    _sim.reset_turn()
+    _sim.record_prefill(32, 32)
+    for _i in range(5):
+        _sim.record_decode_step(33 + _i)
+    _sum = _sim.session_summary()
+    print("tiered_memory_sim.py OK —", _sum["tokens_generated"], "decode steps;",
+          f"bytes_moved={_sum['total_bytes_moved']:,}")

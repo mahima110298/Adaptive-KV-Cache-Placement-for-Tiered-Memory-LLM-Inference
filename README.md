@@ -42,10 +42,18 @@ pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu1
 pip install huggingface_hub pandas matplotlib jupyter tabulate
 
 # 2. Launch Jupyter and open the notebook
-jupyter notebook track_b.ipynb
+jupyter notebook "Adaptive KV-Cache Placement for Tiered-Memory LLM Inference.ipynb"
 ```
 
 CUDA 12.4 + compatible driver assumed. For other CUDA versions, swap `cu124` for `cu122` / `cu121` in the install command.
+
+**Quick run (simulator only, no GPU):** from this directory,
+
+```bash
+python tiered_memory_sim.py
+```
+
+prints a short smoke test of the tiered-memory model. Full experiments (real models, figures, CSVs) still go through the notebook above.
 
 ### Option C — Local CPU only (no GPU)
 
@@ -59,7 +67,11 @@ The notebook auto-detects no GPU and falls back to CPU; only SmolLM2-135M will r
 
 ## Outputs
 
-Every cell writes deterministically to `/content/track_b_outputs_<gpu>/` (Colab) where `<gpu>` is `a100`, `t4`, etc. Locally use `./track_b_outputs_<gpu>/`.
+**Paths:** On **Google Colab**, the notebook uses `/content/...` (Colab’s runtime root)—for example `/content/models` for downloads and `/content/track_b_outputs_<gpu>/` for artifacts. Those absolute paths are **Colab-specific**; the rubric expects no hard dependency on them for local use.
+
+On your **own machine**, use **relative paths from the project directory** instead—for example `./models` (or whatever you set `MODELS_DIR` to) and `./track_b_outputs_<gpu>/` (same layout as Colab, without `/content`). You do not need `/content` locally.
+
+Every cell writes deterministically under that output folder, where `<gpu>` is `a100`, `t4`, etc.
 
 | File                                | Contents                                                       |
 |-------------------------------------|----------------------------------------------------------------|
@@ -84,10 +96,12 @@ All figures are PNG @ 200 DPI, sized for an IEEE double-column page.
 
 ## Path independence
 
-The notebook uses `/content/...` paths (Colab convention). For local runs, modify the two constants near the top of cells 3 and 6:
+The notebook defaults to `/content/models` and `/content/track_b_outputs` so runs work out-of-the-box on **Colab** (`/content` is Colab’s working area). For **local** runs, point those at relative directories (no leading slash), e.g. `models` and `track_b_outputs`, or explicitly `./models` and `./track_b_outputs` if you prefer—same filenames, just not under `/content`.
+
+Edit the two constants near the top of cells 3 and 6, for example:
 ```python
-MODELS_DIR = '/content/models'           → 'models'
-OUT_DIR    = '/content/track_b_outputs'  → 'track_b_outputs'
+MODELS_DIR = '/content/models'           → 'models'          # or './models'
+OUT_DIR    = '/content/track_b_outputs'  → 'track_b_outputs' # or './track_b_outputs'
 ```
 No other paths are hard-coded; everything else is relative or auto-derived from runtime detection.
 
